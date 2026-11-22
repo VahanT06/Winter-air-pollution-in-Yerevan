@@ -1,0 +1,1486 @@
+---
+title: "Winter Air Pollution in Yerevan"
+subtitle: "Is it the weather, or is it us?"
+author: "DS116 Data Visualization: group project"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 9, fig.height = 5, fig.align = "center", dpi = 150
+)
+options(scipen = 999)
+```
+
+# The question
+
+Every winter the air in Yerevan becomes unhealthy. The official explanation is
+geography and climate: the city sits in a basin, and in the cold months a layer
+of still air (a temperature inversion) acts like a lid that traps pollution.
+
+If weather is the whole story, there is little the city can do. If the
+pollution is produced by people and only trapped by the weather, there is room
+for policy. So we ask:
+
+> **How much of Yerevan's winter PM2.5 pollution is explained by weather, and
+> how much by human activity?**
+
+**Our hypothesis:** weather decides *how much* pollution stays over the city,
+but people decide *whether there is anything to trap*.
+
+PM2.5 means particles smaller than 2.5 micrometres. They are small enough to
+reach deep into the lungs, which is why the World Health Organization (WHO) sets
+a guideline of **15 µg/m³ for a 24-hour average**.
+
+# Data and preparation
+
+```{r packages}
+library(tidyverse)   # data wrangling and ggplot2
+library(lubridate)   # dates and time zones
+library(patchwork)   # combining plots
+library(broom)       # tidy model output
+library(sandwich)    # robust (Newey-West) standard errors
+library(lmtest)      # coefficient tests with robust errors
+library(ggrepel)     # non-overlapping labels
+library(scales)      # axis labels
+```
+
+We use three main files, and two small files of published figures that are
+used only in Section 8:
+
+| File | Content | Source |
+|---|---|---|
+| `yerevan_pm_hourly_sensorcommunity_full.csv` | Hourly PM2.5 and PM10 per sensor | Sensor.community (citizen sensors) |
+| `yerevan_pm_sensors_full.csv` | Sensor type and coordinates | Sensor.community |
+| `yerevan_weather_hourly_openmeteo_2023_2026.csv` | Hourly weather for central Yerevan | Open-Meteo (ERA5 reanalysis) |
+| `armenia_household_gas_monthly_2020.csv` | Natural gas used by households, by month | R2E2 (2022), Figure 1.5 |
+| `yerevan_heating_fuels.csv` | Heating fuels of Yerevan households and PM2.5 emitted per unit of heat | ILCS 2020 survey in R2E2 (2022); German emission inventory (2025) |
+
+## Settings
+
+All thresholds are defined once here, so every later step uses the same values
+and a change needs to be made in one place only.
+
+```{r settings}
+data_dir <- "data"                     # folder that contains the data files
+
+EXCLUDED_SENSORS <- c(83835, 99632)    # see "Cleaning" below
+MIN_READINGS     <- 5                  # raw readings needed for a valid hour
+MIN_HOURS        <- 18                 # valid hours needed for a valid day (75%)
+WHO_DAILY        <- 15                 # WHO 24-hour PM2.5 guideline, µg/m³
+WINTER_MONTHS    <- c(11, 12, 1, 2)    # heating season
+EPISODE_LEVEL    <- 25                 # WHO interim target 2 (24-hour), used to define an episode
+CALM_WIND        <- 1.4                # m/s: the median winter daily wind, our line for "still air"
+WARM_MONTHS      <- 5:9                # no heating
+HUMID_LIMIT      <- 90                 # relative humidity (%) used in robustness
+HOLIDAYS         <- c("12-31", "01-01", "01-02", "01-03", "01-04",
+                      "01-05", "01-06", "01-07")   # official non-working days in Armenia
+PANEL_SENSORS    <- c(80868, 83131, 84847, 85218)  # sensors active in all winters
+LONG_SENSORS     <- c(80868, 83131)    # sensors covering all three winters fully
+LOCAL_TZ         <- "Asia/Yerevan"     # UTC+4, no daylight saving
+```
+
+## Loading
+
+Column types are stated explicitly, so R never has to guess them.
+
+```{r load}
+read_project_csv <- function(file, col_types) {
+  path <- file.path(data_dir, file)
+  if (!file.exists(path)) stop("File not found: ", path)
+  read_csv(path, col_types = col_types)
+}
+
+pm_raw <- read_project_csv(
+  "yerevan_pm_hourly_sensorcommunity_full.csv",
+  cols(sensor_id = col_integer(), hour_utc = col_datetime(),
+       pm10 = col_double(), pm25 = col_double(),
+       n_readings_pm10 = col_integer(), n_readings_pm25 = col_integer())
+)
+sensors <- read_project_csv(
+  "yerevan_pm_sensors_full.csv",
+  cols(sensor_id = col_integer(), sensor_type = col_character(),
+       lat = col_double(), lon = col_double())
+)
+weather_raw <- read_project_csv(
+  "yerevan_weather_hourly_openmeteo_2023_2026.csv",
+  cols(time = col_datetime(), .default = col_double())
+)
+```
+
+## Integrity checks
+
+Before any analysis we confirm the data is what we think it is. If any check
+fails, the report stops here.
+
+```{r checks}
+stopifnot(
+  "duplicate sensor-hour rows" = !any(duplicated(pm_raw[c("sensor_id", "hour_utc")])),
+  "negative PM values"         = all(pm_raw$pm25 >= 0 & pm_raw$pm10 >= 0),
+  "PM2.5 larger than PM10"     = all(pm_raw$pm25 <= pm_raw$pm10),
+  "gaps in weather series"     = all(diff(as.numeric(weather_raw$time)) == 3600)
+)
+
+tibble(
+  Table  = c("PM (sensor-hours)", "Sensors", "Weather (hours)"),
+  Rows   = c(nrow(pm_raw), nrow(sensors), nrow(weather_raw)),
+  `Missing values` = c(sum(is.na(pm_raw)), sum(is.na(sensors)), sum(is.na(weather_raw)))
+)
+```
+
+The only missing values are in the weather file, all in `boundary_layer_height`
+(January to June 2024). We keep those rows and remove them explicitly, with
+`filter(!is.na(...))`, only in the steps that need this variable.
+
+## Cleaning
+
+```{r clean}
+pm <- pm_raw %>%
+  filter(!sensor_id %in% EXCLUDED_SENSORS,     # keep the comparable Yerevan sensors
+         n_readings_pm25 >= MIN_READINGS) %>%  # keep hours with enough raw readings
+  select(sensor_id, hour_utc, pm25, pm10)
+
+weather <- weather_raw %>%
+  transmute(
+    hour_utc = time,
+    temp = temperature_2m,            # °C
+    rh   = relative_humidity_2m,      # %
+    rain = precipitation,             # mm
+    wind = wind_speed_10m,            # m/s
+    blh  = boundary_layer_height      # m
+  )
+```
+
+- **Excluded sensors.** Sensor 83835 is not located in Yerevan. Sensor 99632 is
+  a different sensor model that only started in June 2026, has no winter data,
+  and reads about three times higher than the others. Keeping it would distort
+  the city value.
+- **Minimum readings.** A sensor reports about every 2.5 minutes. An hour built
+  from fewer than `r MIN_READINGS` readings is not a reliable hourly average.
+  This removes `r percent(mean(pm_raw$n_readings_pm25 < MIN_READINGS), 0.1)` of rows.
+
+After cleaning we have `r comma(nrow(pm))` sensor-hours from
+`r n_distinct(pm$sensor_id)` sensors.
+
+**Boundary layer height (BLH)** is the key weather variable in this report. It
+is the height of the layer of air next to the ground in which pollution can
+mix. A low value means a low "lid" over the city.
+
+## City index, local time and seasons
+
+The timestamps are in UTC. People live on local time, so we convert **before**
+any hour-of-day or weekday analysis.
+
+For each hour we take the **median** across sensors as the city value. The
+median is not affected by one faulty or badly placed sensor.
+
+```{r city-index}
+add_time_parts <- function(data) {
+  data %>%
+    mutate(
+      local_time = with_tz(hour_utc, LOCAL_TZ),
+      date    = as_date(local_time),
+      hour    = hour(local_time),
+      month   = month(local_time),
+      weekday = factor(c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")[wday(local_time, week_start = 1)],
+                       levels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")),
+      season  = case_when(month %in% WINTER_MONTHS ~ "Winter",
+                          month %in% WARM_MONTHS   ~ "Warm season",
+                          TRUE                     ~ "Transition")
+    )
+}
+
+build_city_hourly <- function(pm_data) {
+  pm_data %>%
+    group_by(hour_utc) %>%
+    summarise(pm25 = median(pm25), pm10 = median(pm10), n_sensors = n(), .groups = "drop") %>%
+    left_join(weather, by = "hour_utc") %>%   # keep every PM hour, even without weather
+    add_time_parts()
+}
+
+city_hourly <- build_city_hourly(pm)
+```
+
+`left_join()` keeps all `r comma(nrow(city_hourly))` city hours. The weather
+file ends one day earlier than the PM file, so
+`r sum(is.na(city_hourly$temp))` hours have no weather. They are used in the
+descriptive charts and drop out only where weather is needed.
+
+## Daily table
+
+The WHO guideline refers to a 24-hour average, so we need daily values. A day
+counts only if it has at least `r MIN_HOURS` valid hours (75%). A "daily mean"
+built from a few night hours would not be comparable.
+
+```{r daily}
+weather_daily <- weather %>%
+  mutate(date = as_date(with_tz(hour_utc, LOCAL_TZ))) %>%
+  group_by(date) %>%
+  summarise(temp = mean(temp), rh = mean(rh), wind = mean(wind),
+            blh = mean(blh), rain_mm = sum(rain), rain_day = sum(rain) > 0, .groups = "drop")
+
+winter_label <- function(date) {
+  start_year <- if_else(month(date) >= 11, year(date), year(date) - 1)
+  paste0(start_year, "/", str_sub(start_year + 1, 3, 4))
+}
+
+build_daily <- function(hourly) {
+  hourly %>%
+    group_by(date) %>%
+    summarise(pm25 = mean(pm25), n_hours = n(), .groups = "drop") %>%
+    filter(n_hours >= MIN_HOURS) %>%
+    left_join(weather_daily, by = "date") %>%
+    mutate(month   = month(date),
+           is_weekend = wday(date, week_start = 1) >= 6,
+           season  = case_when(month %in% WINTER_MONTHS ~ "Winter",
+                               month %in% WARM_MONTHS   ~ "Warm season",
+                               TRUE                     ~ "Transition"),
+           winter  = if_else(season == "Winter", winter_label(date), NA_character_))
+}
+
+city_daily   <- build_daily(city_hourly)
+winter_daily <- city_daily %>% filter(season == "Winter")
+```
+
+We have `r nrow(city_daily)` valid days, of which `r nrow(winter_daily)` are
+winter days (November to February).
+
+## Visual style
+
+One theme and one colour vocabulary are used in every chart:
+
+- **Winter is always dark blue, the warm season always orange.** The two differ
+  in hue and in lightness, so they stay distinguishable for colour-blind
+  readers and in greyscale (Okabe-Ito palette).
+- **The WHO guideline is always the same red dashed line.**
+- **Amounts of pollution** use a sequential palette where darker means more.
+- Titles state the finding; subtitles say what is plotted.
+
+The rules behind these choices come from the course. **Tufte's principles**: the
+visual size of an effect must match its size in the data (Lie Factor near 1), so
+bars start at zero and no chart is drawn in 3D; everything carries units and a
+source (thorough labelling); and every comparison is shown against something
+(*"compared to what?"*). **Data-ink**: anything that can be erased without losing
+information is removed. **Gestalt principles** group elements on purpose:
+enclosure (shaded winter bands), proximity (panels and paired bars), connection
+(lines over points), similarity (one colour per season everywhere).
+**Colour** follows the HCL logic: a qualitative pair for seasons, sequential
+scales for amounts, diverging scales centred on zero for residuals and
+correlations. 
+
+```{r style}
+COL_WINTER <- "#0B4F8A"
+COL_WARM   <- "#E69F00"
+COL_WHO    <- "#C0392B"
+COL_GREY   <- "grey45"
+SEASON_COLOURS <- c("Winter" = COL_WINTER, "Warm season" = COL_WARM)
+PM_AXIS     <- "PM2.5 (\u00b5g/m\u00b3)"              # unicode escapes: safe on any computer
+PM_AXIS_LOG <- "PM2.5 (\u00b5g/m\u00b3, log scale)"
+PM_LEGEND   <- "Median PM2.5\n(\u00b5g/m\u00b3)"
+SOURCE <- "Data: Sensor.community (PM2.5), Open-Meteo / ERA5 (weather). Local time (UTC+4)."
+
+theme_project <- function(base_size = 12) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.title         = element_text(face = "bold", size = base_size + 2),
+      plot.subtitle      = element_text(colour = "grey30", margin = margin(b = 10)),
+      plot.caption       = element_text(colour = "grey45", size = base_size - 3, hjust = 0),
+      plot.title.position   = "plot",
+      plot.caption.position = "plot",
+      panel.grid.minor   = element_blank(),
+      legend.position    = "top",
+      legend.justification = "left",
+      strip.text         = element_text(face = "bold", hjust = 0)
+    )
+}
+theme_set(theme_project())
+
+who_line <- function() {
+  geom_hline(yintercept = WHO_DAILY, colour = COL_WHO, linetype = "dashed", linewidth = 0.6)
+}
+```
+
+# How bad is it, and when?
+
+## Three years of daily air quality
+
+```{r fig-timeline, fig.height=4.6}
+winter_spans <- winter_daily %>%
+  group_by(winter) %>%
+  summarise(start = min(date), end = max(date), .groups = "drop")
+
+ggplot(city_daily, aes(date, pm25)) +
+  geom_rect(data = winter_spans, inherit.aes = FALSE,
+            aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf),
+            fill = COL_WINTER, alpha = 0.10) +
+  geom_text(data = winter_spans, inherit.aes = FALSE,
+            aes(x = start + (end - start) / 2, y = 108, label = paste("Winter", winter)),
+            colour = COL_WINTER, size = 3.3, fontface = "bold") +
+  geom_line(colour = "grey20", linewidth = 0.35) +
+  who_line() +
+  annotate("text", x = as.Date("2024-08-15"), y = WHO_DAILY, vjust = -0.8,
+           label = "WHO guideline: 15", colour = COL_WHO, size = 3.3) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y", expand = expansion(0.01)) +
+  scale_y_continuous(limits = c(0, 112), expand = expansion(c(0, 0.02))) +
+  labs(title = "Every winter, Yerevan's air rises far above the WHO guideline",
+       subtitle = "Daily mean PM2.5, median of the city's sensors. Shaded bands are November to February.",
+       x = NULL, y = PM_AXIS, caption = SOURCE)
+```
+
+```{r exceedance-numbers}
+exceed_winter <- mean(winter_daily$pm25 > WHO_DAILY)
+exceed_warm   <- mean(city_daily$pm25[city_daily$season == "Warm season"] > WHO_DAILY)
+```
+
+A line chart is the natural choice for a continuous time series: the line shows
+the order and the connection between days. The shaded bands group the winter
+days (Gestalt principle of enclosure), and the WHO line gives the "compared to
+what?" context. The y-axis starts at zero so the height above the guideline is
+not exaggerated.
+
+**What we see.** The pattern repeats each year: clean from spring to autumn,
+then a wall of pollution from November. In winter,
+**`r percent(exceed_winter)` of days exceed the WHO guideline**; in the warm
+season, `r percent(exceed_warm, 0.1)`.
+
+## A calendar of bad days
+
+```{r fig-calendar, fig.height=6.2}
+who_breaks <- c(0, 15, 25, 37.5, 50, 75, Inf)
+who_labels <- c("up to 15 (within guideline)", "15 to 25", "25 to 37.5", "37.5 to 50", "50 to 75", "above 75")
+
+city_daily %>%
+  mutate(level = cut(pm25, who_breaks, who_labels),
+         year  = year(date),
+         month_name = factor(month.abb[month], levels = rev(month.abb))) %>%
+  ggplot(aes(day(date), month_name, fill = level)) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  facet_wrap(~ year, ncol = 2) +
+  scale_fill_viridis_d(option = "rocket", direction = -1, drop = FALSE,
+                       name = "Daily PM2.5 (\u00b5g/m\u00b3)") +
+  scale_x_continuous(breaks = c(1, 10, 20, 31), expand = expansion(0)) +
+  coord_cartesian(clip = "off") +
+  labs(title = "Bad air is a season, not an accident",
+       subtitle = "Each tile is one day. Empty tiles are days without enough data.",
+       x = "Day of month", y = NULL, caption = SOURCE) +
+  theme(panel.grid = element_blank(), legend.position = "right",
+        panel.spacing = unit(1.2, "lines"))
+```
+
+A heatmap shows every single day without overplotting. The classes are the
+WHO guideline (15) and the WHO interim targets (25, 37.5, 50, 75), so each
+colour step has a health meaning. The palette is sequential (light to dark)
+because the data runs from low to high, and it is colour-blind safe.
+
+**What we see.** The dark tiles form the same block every year, from November
+to February. Inside the block there are also light days: winter air is not
+bad *every* day. Section 5 asks what separates the dark days from the light
+ones.
+
+## The seasonal gap
+
+```{r fig-monthly, fig.height=4.8}
+monthly <- city_daily %>%
+  mutate(month_name = factor(month.abb[month], levels = month.abb),
+         period = if_else(season == "Winter", "Winter", "Rest of the year"))
+
+monthly_share <- monthly %>%
+  group_by(month_name) %>%
+  summarise(share = mean(pm25 > WHO_DAILY), .groups = "drop")
+
+ggplot(monthly, aes(month_name, pm25)) +
+  geom_boxplot(aes(fill = period), outlier.size = 0.7, outlier.alpha = 0.5, linewidth = 0.35) +
+  who_line() +
+  geom_text(data = monthly_share, aes(y = 190, label = percent(share, 1)),
+            size = 3.2, colour = "grey25") +
+  scale_y_log10(breaks = c(1, 2, 5, 15, 50, 100)) +
+  scale_fill_manual(values = c("Winter" = COL_WINTER, "Rest of the year" = "grey80"), name = NULL) +
+  coord_cartesian(xlim = c(0.4, 12.6), expand = FALSE, ylim = c(0.8, 230)) +
+  labs(title = "December air is about nine times dirtier than May air",
+       subtitle = "Distribution of daily PM2.5 by month, all years (log scale).\nNumbers on top: share of days above the WHO guideline.",
+       x = NULL, y = PM_AXIS_LOG, caption = SOURCE)
+```
+
+```{r monthly-numbers}
+month_median <- city_hourly %>% group_by(month) %>% summarise(med = median(pm25))
+dec_med <- month_median$med[month_median$month == 12]
+may_med <- month_median$med[month_median$month == 5]
+```
+
+Boxplots compare whole distributions, not only averages. PM2.5 is strongly
+right-skewed (most days are low, a few are very high), so we use a log scale.
+On a linear scale the summer boxes would be squeezed flat.
+
+**What we see.** The median hour in December is `r round(dec_med, 1)` µg/m³,
+against `r round(may_med, 1)` in May: a factor of
+`r round(dec_med / may_med, 1)`. From April to October almost no day exceeds
+the guideline.
+
+# Can we trust citizen sensors?
+
+The sensors are low-cost devices run by volunteers. If they measure something
+real, sensors in different parts of the city should rise and fall together.
+
+```{r fig-correlation, fig.width=6.5, fig.height=5.2}
+sensor_daily <- pm %>%
+  mutate(date = as_date(with_tz(hour_utc, LOCAL_TZ))) %>%
+  group_by(sensor_id, date) %>%
+  summarise(pm25 = mean(pm25), n_hours = n(), .groups = "drop") %>%
+  filter(n_hours >= MIN_HOURS)
+
+cor_matrix <- sensor_daily %>%
+  select(sensor_id, date, pm25) %>%
+  pivot_wider(names_from = sensor_id, values_from = pm25) %>%
+  select(-date) %>%
+  cor(use = "pairwise.complete.obs")   # each pair uses the days both sensors have
+
+cor_long <- as.data.frame(as.table(cor_matrix)) %>%
+  rename(sensor_a = Var1, sensor_b = Var2, r = Freq) %>%
+  filter(as.integer(sensor_a) > as.integer(sensor_b))   # lower triangle only
+
+ggplot(cor_long, aes(sensor_b, sensor_a, fill = r)) +
+  geom_tile(colour = "white", linewidth = 1) +
+  geom_text(aes(label = sprintf("%.2f", r)), colour = "white", size = 3.6) +
+  scale_fill_viridis_c(option = "mako", direction = -1, limits = c(0, 1), name = "Correlation") +
+  coord_fixed() +
+  labs(title = "The sensors tell the same story",
+       subtitle = "Correlation of daily PM2.5 between each pair of sensors",
+       x = "Sensor", y = "Sensor", caption = SOURCE) +
+  theme(panel.grid = element_blank(), legend.position = "right")
+```
+
+A correlation matrix is symmetric, so we show only the lower triangle: the
+other half would repeat the same numbers. The colour scale runs over the full
+0 to 1 range, so high values are not visually exaggerated.
+
+**What we see.** All pairs correlate between `r sprintf("%.2f", min(cor_long$r))`
+and `r sprintf("%.2f", max(cor_long$r))`. Independent devices in different
+districts agree almost perfectly, so the signal is real and city-wide.
+
+# The weather effect
+
+## The lid over the city
+
+```{r model-data}
+# Winter days that have boundary layer data
+winter_model_data <- winter_daily %>% filter(!is.na(blh))
+```
+
+```{r fig-blh, fig.height=4.8}
+winter_model_data %>%
+  mutate(wind_class = if_else(wind < median(wind), "Calmer half of days", "Windier half of days")) %>%
+  ggplot(aes(blh, pm25)) +
+  geom_point(aes(colour = wind_class), alpha = 0.7, size = 1.8) +
+  geom_smooth(method = "lm", colour = "black", linewidth = 0.7, fill = "grey75") +
+  who_line() +
+  scale_x_log10() + scale_y_log10() +
+  scale_colour_manual(values = c("Calmer half of days" = "#7B3294", "Windier half of days" = "#35978F"), name = NULL) +
+  labs(title = "The lower the lid, the dirtier the air",
+       subtitle = "Winter days: daily PM2.5 against daily mean boundary layer height. Both axes on log scale.",
+       x = "Boundary layer height (m, log scale)", y = PM_AXIS_LOG, caption = SOURCE)
+```
+
+A scatterplot shows the relationship between two numeric variables. On log
+scales the relationship is close to a straight line, which is why we later
+model `log(PM2.5)`. The grey band is the 95% confidence interval of the fitted
+line.
+
+**What we see.** Days with a boundary layer below 50 m are mostly far above the
+guideline; days above 300 m are mostly below it. Calm days (purple) sit higher
+than windy days (green) at the same lid height.
+
+## Lid and wind together
+
+```{r fig-weather-grid, fig.height=4.2}
+winter_hours <- city_hourly %>% filter(season == "Winter", !is.na(blh))
+
+winter_hours %>%
+  mutate(blh_class  = cut(blh, c(0, 25, 50, 100, 200, 400, 800, Inf),
+                          c("under 25", "25-50", "50-100", "100-200", "200-400", "400-800", "over 800")),
+         wind_class = cut(wind, c(-Inf, 1, 2, 3, Inf),
+                          c("under 1", "1-2", "2-3", "over 3"))) %>%
+  group_by(blh_class, wind_class) %>%
+  summarise(pm25 = median(pm25), n = n(), .groups = "drop") %>%
+  filter(n >= 30) %>%                       # medians of tiny groups are not reliable
+  ggplot(aes(blh_class, wind_class, fill = pm25)) +
+  geom_tile(colour = "white", linewidth = 1) +
+  geom_text(aes(label = round(pm25), colour = pm25 > 20), size = 3.8, show.legend = FALSE) +
+  scale_fill_viridis_c(option = "rocket", direction = -1, limits = c(0, NA), name = PM_LEGEND) +
+  scale_colour_manual(values = c("TRUE" = "white", "FALSE" = "black")) +
+  labs(title = "Winter air is clean only with strong wind or a very high lid",
+       subtitle = "Median PM2.5 of winter hours for each combination of lid height and wind speed (groups of 30+ hours).",
+       x = "Boundary layer height (m)", y = "Wind speed (m/s)", caption = SOURCE) +
+  theme(panel.grid = element_blank(), legend.position = "right")
+```
+
+With thousands of hours a scatterplot would be one dark cloud (overplotting),
+so we bin both variables and show the median of each cell.
+
+**What we see.** The darkest cells are in the bottom row: when the air is
+still, pollution stays high even under a moderately high lid. The air becomes
+clean only when the wind is strong or the lid rises above about 800 m.
+
+## How much of winter does weather explain?
+
+We fit a linear model on the `r nrow(winter_model_data)` winter days:
+
+$$\log(\text{PM2.5}) = \beta_0 + \beta_1 \log(\text{BLH}) + \beta_2\,\text{wind} + \beta_3\,\text{temperature} + \beta_4\,\text{humidity} + \beta_5\,\text{rain} + \varepsilon$$
+
+We model the logarithm because PM2.5 is right-skewed and weather acts
+multiplicatively (it dilutes pollution by a factor, not by a fixed amount).
+Pollution on one day is related to the day before, so ordinary standard errors
+would be too optimistic. We use Newey-West standard errors, which correct for
+this.
+
+```{r weather-model}
+weather_model <- lm(log(pm25) ~ log(blh) + wind + temp + rh + rain_day, data = winter_model_data)
+weather_r2    <- summary(weather_model)$r.squared
+
+robust <- coeftest(weather_model, vcov. = NeweyWest(weather_model))
+
+# Turn log-coefficients into "% change in PM2.5" for an easy-to-read step in each variable
+effects <- tibble(
+  term  = rownames(robust)[-1],
+  beta  = robust[-1, "Estimate"],
+  se    = robust[-1, "Std. Error"],
+  step  = c(log(2), 1, 5, 10, 1),
+  label = c("Boundary layer twice as high", "Wind +1 m/s", "Temperature +5 \u00b0C",
+            "Humidity +10 points", "Day with rain or snow")
+) %>%
+  mutate(effect = exp(beta * step) - 1,
+         low    = exp((beta - 1.96 * se) * step) - 1,
+         high   = exp((beta + 1.96 * se) * step) - 1,
+         clear  = low > 0 | high < 0)
+```
+
+```{r fig-coefficients, fig.height=3.6}
+ggplot(effects, aes(effect, reorder(label, -effect), colour = clear)) +
+  geom_vline(xintercept = 0, colour = "grey40") +
+  geom_pointrange(aes(xmin = low, xmax = high), linewidth = 0.8, size = 0.6) +
+  scale_x_continuous(labels = label_percent()) +
+  scale_colour_manual(values = c("TRUE" = COL_WINTER, "FALSE" = "grey60"), guide = "none") +
+  labs(title = "A higher lid and more wind clean the air; the other variables show no clear effect",
+       subtitle = "Change in winter daily PM2.5 for a step in each weather variable, others held fixed.\nBars are 95% confidence intervals; grey means the interval includes zero.",
+       x = "Change in PM2.5", y = NULL, caption = SOURCE)
+```
+
+A coefficient plot shows the size of each effect together with its
+uncertainty. An interval that crosses zero means the data cannot tell the
+effect apart from no effect.
+
+**What we see.** Doubling the boundary layer height lowers PM2.5 by
+`r percent(-effects$effect[1])`, and each extra m/s of wind by
+`r percent(-effects$effect[2])`. Together, the weather variables explain
+**`r percent(weather_r2)` of the day-to-day variation** in winter PM2.5.
+
+```{r fig-predicted, fig.height=5.2}
+winter_model_data %>%
+  mutate(predicted = exp(fitted(weather_model))) %>%
+  select(date, winter, Measured = pm25, `Predicted from weather alone` = predicted) %>%
+  pivot_longer(c(Measured, `Predicted from weather alone`), names_to = "series", values_to = "pm25") %>%
+  filter(winter != "2023/24") %>%          # 2023/24 has boundary layer data for Nov-Dec only
+  ggplot(aes(date, pm25, colour = series)) +
+  geom_line(linewidth = 0.6) +
+  facet_wrap(~ paste("Winter", winter), scales = "free_x", ncol = 1) +
+  scale_y_log10() +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b %Y") +
+  scale_colour_manual(values = c("Measured" = "grey15", "Predicted from weather alone" = "#D55E00"), name = NULL) +
+  labs(title = "Weather tells us which winter days will be bad",
+       subtitle = "Measured daily PM2.5 and the value predicted by the weather model.",
+       x = NULL, y = PM_AXIS_LOG, caption = SOURCE)
+```
+
+**What we see.** The predicted line follows the main episodes and the clean
+breaks between them. So the official explanation is partly right: **weather
+decides which days are bad.** But this only describes variation *within*
+winter. It does not yet say why there is something to trap. For that we
+compare winter with the warm season.
+
+# How episodes build and break
+
+Winter pollution does not arrive one day and leave the next. It accumulates.
+This section finishes the weather side of the story: weather sets not only the
+level of a single day, but how pollution stacks up over many days.
+
+```{r episode-data}
+winter_series <- winter_daily %>%
+  arrange(date) %>%
+  group_by(winter) %>%
+  mutate(
+    change   = c(NA, diff(log(pm25))),   # day-to-day change, in log terms = relative change
+    is_calm  = !is.na(wind) & wind < CALM_WIND,
+    calm_run = sequence(rle(is_calm)$lengths) * is_calm   # length of the current calm streak
+  ) %>%
+  ungroup()
+
+# Episodes = runs of consecutive winter days above the WHO interim target
+episode_runs <- winter_series %>%
+  group_by(winter) %>%
+  summarise(runs = list(rle(pm25 > EPISODE_LEVEL)), .groups = "drop")
+
+episode_lengths <- episode_runs$runs %>% map(~ .x$lengths[.x$values]) %>% unlist()
+
+# Correlation between a day and the day before it, using only real consecutive pairs
+persistence <- winter_series %>%
+  group_by(winter) %>%
+  mutate(previous = if_else(date - lag(date) == 1, lag(pm25), NA_real_)) %>%
+  ungroup() %>%
+  summarise(r = cor(pm25, previous, use = "complete.obs")) %>%
+  pull(r)
+```
+
+```{r fig-accumulation, fig.height=4.2}
+calm_build <- winter_series %>%
+  filter(is_calm, calm_run >= 1) %>%
+  mutate(run = pmin(calm_run, 5)) %>%
+  group_by(run) %>%
+  summarise(pm25 = median(pm25), n = n(), .groups = "drop")
+
+wind_change <- winter_series %>%
+  filter(!is.na(change)) %>%
+  mutate(wind_class = cut(wind, quantile(wind, c(0, .25, .5, .75, 1), na.rm = TRUE),
+                          include.lowest = TRUE,
+                          labels = c("Calmest\nquarter", "2nd", "3rd", "Windiest\nquarter"))) %>%
+  group_by(wind_class) %>%
+  summarise(pct_per_day = exp(mean(change)) - 1, n = n(), .groups = "drop")
+
+p_build <- ggplot(calm_build, aes(factor(run), pm25)) +
+  geom_col(fill = COL_WINTER, width = 0.7) +
+  who_line() +
+  geom_text(aes(label = round(pm25)), vjust = -0.5, size = 3.6, colour = "grey20") +
+  scale_x_discrete(labels = c("1", "2", "3", "4", "5 or more")) +
+  scale_y_continuous(expand = expansion(c(0, 0.12))) +
+  labs(subtitle = "Each still day adds to the last",
+       x = "Consecutive days with light wind", y = PM_AXIS)
+
+p_clear <- ggplot(wind_change, aes(wind_class, pct_per_day, fill = pct_per_day > 0)) +
+  geom_col(width = 0.7) +
+  geom_hline(yintercept = 0, colour = "grey30") +
+  geom_text(aes(label = percent(pct_per_day, 1), vjust = if_else(pct_per_day > 0, -0.5, 1.4)),
+            size = 3.6, colour = "grey20") +
+  scale_y_continuous(labels = label_percent(), expand = expansion(0.18)) +
+  scale_fill_manual(values = c("TRUE" = COL_WHO, "FALSE" = "#35978F"), guide = "none") +
+  labs(subtitle = "Wind undoes it",
+       x = "Winter days sorted by wind speed", y = "Change from one day to the next")
+
+p_build + p_clear +
+  plot_annotation(title = "Pollution piles up on still days and is swept out by wind",
+                  caption = SOURCE)
+```
+
+The left panel starts at zero because bar length is the comparison (Tufte's
+first principle). The right panel is a change, so it is drawn around a zero
+line, and the two directions are coloured differently.
+
+**What we see.** "Still" here means a daily mean wind below `r CALM_WIND` m/s,
+the middle of our winter days. After one still day the city sits at
+`r round(calm_build$pm25[1])` µg/m³; after five it is
+`r round(calm_build$pm25[nrow(calm_build)])`. In the calmest quarter of days
+pollution grows by `r percent(wind_change$pct_per_day[1], 1)` per day, while in
+the windiest quarter it falls by
+`r percent(abs(wind_change$pct_per_day[nrow(wind_change)]), 1)`. One winter day
+is strongly related to the one before it (correlation
+`r sprintf("%.2f", persistence)`), which is why episodes last:
+`r length(episode_lengths)` of them in three winters, lasting
+`r median(episode_lengths)` days at the middle and up to
+`r max(episode_lengths)`, and together covering
+`r percent(sum(episode_lengths) / nrow(winter_series))` of all winter days.
+
+## The longest episode
+
+```{r fig-episode, fig.height=5.4}
+longest <- winter_series %>%
+  group_by(winter) %>%
+  mutate(block = cumsum(pm25 <= EPISODE_LEVEL | is.na(pm25))) %>%
+  filter(pm25 > EPISODE_LEVEL) %>%
+  group_by(winter, block) %>%
+  filter(n() == max(episode_lengths)) %>%
+  ungroup()
+
+window <- winter_series %>%
+  filter(date >= min(longest$date) - 4, date <= max(longest$date) + 4)
+
+band <- annotate("rect", xmin = min(longest$date) - 0.5, xmax = max(longest$date) + 0.5,
+                 ymin = -Inf, ymax = Inf, fill = COL_WINTER, alpha = 0.10)
+
+p_ep_pm <- ggplot(window, aes(date, pm25)) +
+  band +
+  geom_line(colour = "grey20", linewidth = 0.6) + geom_point(size = 1.6, colour = "grey20") +
+  who_line() +
+  annotate("text", x = min(longest$date), y = max(window$pm25) * 1.02,
+           label = paste(max(episode_lengths), "days in a row above", EPISODE_LEVEL),
+           hjust = 0, fontface = "bold", colour = COL_WINTER, size = 3.5) +
+  scale_y_continuous(limits = c(0, NA), expand = expansion(c(0, 0.08))) +
+  labs(subtitle = "Daily PM2.5", x = NULL, y = PM_AXIS)
+
+p_ep_wx <- window %>%
+  select(date, `Boundary layer (m)` = blh, `Wind (m/s)` = wind, `Rain or snow (mm)` = rain_mm) %>%
+  pivot_longer(-date) %>%
+  mutate(name = fct_inorder(name)) %>%
+  ggplot(aes(date, value)) +
+  band +
+  geom_line(colour = COL_GREY, linewidth = 0.6) +
+  facet_wrap(~ name, ncol = 3, scales = "free_y") +
+  scale_y_continuous(limits = c(0, NA), expand = expansion(c(0, 0.1))) +
+  labs(subtitle = "The weather over the same days", x = NULL, y = NULL, caption = SOURCE)
+
+p_ep_pm / p_ep_wx + plot_layout(heights = c(2, 1.3))
+```
+
+The weather panels share the x-axis with the pollution panel, so each day can
+be read straight down (Gestalt principle of proximity and alignment).
+
+```{r episode-numbers}
+ep_start <- min(longest$date); ep_end <- max(longest$date)
+```
+
+**What we see.** From `r format(ep_start, "%d %B")` to
+`r format(ep_end, "%d %B %Y")` the city stayed above the WHO interim target for
+`r max(episode_lengths)` days in a row. The wind never rose, the lid sank from
+about `r round(longest$blh[1])` m to `r round(min(longest$blh))` m, and
+pollution climbed from `r round(longest$pm25[1])` to
+`r round(max(longest$pm25))` µg/m³. What ended it was
+`r round(sum(window$rain_mm[window$date >= ep_end - 2 & window$date <= ep_end + 2], na.rm = TRUE), 1)` mm
+of precipitation and a higher lid.
+
+The relief did not last. Within a few days the level was climbing again,
+because nothing had changed on the ground: rain and wind remove what is already
+in the air, not what produces it.
+
+Nothing here says anything about sources yet. It says that the city emits
+steadily, and that the weather decides whether those emissions disperse or
+accumulate. The next section asks what happens when the same weather meets a
+city that is not heating.
+
+# Same weather, different air
+
+If weather alone created the pollution, then the same weather should give the
+same air in any season. The boundary layer is also low on many warm-season
+nights. Does the air get dirty then?
+
+```{r fig-same-weather, fig.height=4.8}
+season_hours <- city_hourly %>%
+  filter(season %in% c("Winter", "Warm season"), !is.na(blh))
+
+blh_breaks <- c(0, 25, 50, 100, 200, 400, 800, 1600, Inf)
+
+same_weather <- season_hours %>%
+  mutate(blh_class = cut(blh, blh_breaks)) %>%
+  group_by(season, blh_class) %>%
+  summarise(blh_mid = median(blh), pm25_med = median(pm25),
+            q25 = quantile(pm25, 0.25), q75 = quantile(pm25, 0.75),
+            n = n(), .groups = "drop") %>%
+  filter(n >= 50)
+
+ggplot(same_weather, aes(blh_mid, pm25_med, colour = season, fill = season)) +
+  geom_ribbon(aes(ymin = q25, ymax = q75), alpha = 0.18, colour = NA) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  who_line() +
+  geom_text(data = ~ filter(.x, blh_class == levels(blh_class)[1]),
+            aes(label = season), vjust = -1.6, hjust = 0.1, fontface = "bold", size = 3.8) +
+  scale_x_log10(breaks = c(20, 50, 100, 200, 500, 1000, 2000)) +
+  scale_y_continuous(limits = c(0, NA), expand = expansion(c(0, 0.05))) +
+  scale_colour_manual(values = SEASON_COLOURS) + scale_fill_manual(values = SEASON_COLOURS) +
+  labs(title = "Under the same lid, winter air is several times dirtier",
+       subtitle = "Median hourly PM2.5 at each boundary layer height. Bands show the middle 50% of hours.",
+       x = "Boundary layer height (m, log scale)", y = PM_AXIS, caption = SOURCE) +
+  theme(legend.position = "none")
+```
+
+```{r same-weather-numbers}
+low_lid <- season_hours %>% filter(blh <= 50) %>% group_by(season) %>% summarise(med = median(pm25), n = n())
+high_lid <- season_hours %>% filter(blh > 800) %>% group_by(season) %>% summarise(med = median(pm25))
+get <- function(tbl, s) tbl$med[tbl$season == s]
+```
+
+The two seasons are drawn in one panel on a shared axis, so they can be
+compared directly at each lid height. The lines are labelled directly instead
+of using a legend. The bands show the spread, not only the middle.
+
+**What we see.** This is the central chart of the project.
+
+- In the warm season the line is flat. Under a lid below 50 m
+  (`r comma(low_lid$n[low_lid$season == "Warm season"])` hours) the median is
+  `r round(get(low_lid, "Warm season"), 1)` µg/m³, the same as under a high
+  lid. **A low lid over a city that is not emitting traps nothing.**
+- In winter, the same low lid gives `r round(get(low_lid, "Winter"), 1)` µg/m³:
+  about `r round(get(low_lid, "Winter") / get(low_lid, "Warm season"))` times more.
+- When the winter air is well mixed (lid above 800 m), winter drops to
+  `r round(get(high_lid, "Winter"), 1)` µg/m³, close to the warm-season level.
+
+## What accounts for what
+
+To put numbers on this, we describe each season with its own model of how
+PM2.5 responds to weather, and then swap the weather between them. This
+answers two "what if" questions: what if the warm season had winter weather,
+and what if winter had warm-season weather?
+
+Temperature is left out of these models on purpose. Cold is weather, but it
+is also the reason people heat, so it cannot be assigned to one side.
+
+```{r decomposition}
+dispersion_formula <- log(pm25) ~ log(blh) + wind + rh + I(rain > 0)
+
+winter_h <- season_hours %>% filter(season == "Winter")
+warm_h   <- season_hours %>% filter(season == "Warm season")
+
+winter_response <- lm(dispersion_formula, data = winter_h)   # how winter emissions react to weather
+warm_response   <- lm(dispersion_formula, data = warm_h)     # how warm-season emissions react to weather
+
+# Typical level (geometric mean) under each combination of emissions and weather
+level <- function(model, weather_data) exp(mean(predict(model, newdata = weather_data)))
+
+scenarios <- tibble(
+  emissions = c("Warm season", "Warm season", "Winter", "Winter"),
+  weather   = c("warm-season weather", "winter weather", "warm-season weather", "winter weather"),
+  pm25      = c(level(warm_response, warm_h),   level(warm_response, winter_h),
+                level(winter_response, warm_h), level(winter_response, winter_h)),
+  kind      = c("Measured", "What if", "What if", "Measured")
+) %>%
+  mutate(label = paste0(emissions, " emissions,\n", weather))
+
+s <- setNames(scenarios$pm25, c("warm", "warm_in_winter_weather", "winter_in_warm_weather", "winter"))
+```
+
+```{r fig-decomposition, fig.height=3.8}
+ggplot(scenarios, aes(pm25, fct_rev(fct_inorder(label)), fill = emissions, alpha = kind)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = sprintf("%.1f", pm25)), hjust = -0.25, size = 4, alpha = 1) +
+  scale_fill_manual(values = SEASON_COLOURS, guide = "none") +
+  scale_alpha_manual(values = c("Measured" = 1, "What if" = 0.55), name = NULL) +
+  scale_x_continuous(limits = c(0, s["winter"] * 1.15), expand = expansion(0)) +
+  labs(title = "Winter weather alone changes nothing; winter emissions alone double the level",
+       subtitle = "Typical hourly PM2.5 (geometric mean) under each combination of emissions and weather.",
+       x = PM_AXIS, y = NULL, caption = SOURCE) +
+  theme(panel.grid.major.y = element_blank())
+```
+
+Bars start at zero because the reader compares their lengths. Solid bars are
+measured; lighter bars are model-based "what if" values.
+
+**What we see.**
+
+- Give the warm season winter's weather and the level stays at
+  `r round(s["warm_in_winter_weather"], 1)` µg/m³ (measured:
+  `r round(s["warm"], 1)`). **Weather alone explains none of the gap.**
+- Give winter the warm season's weather and the level is still
+  `r round(s["winter_in_warm_weather"], 1)` µg/m³, about
+  `r round(s["winter_in_warm_weather"] / s["warm"], 1)` times the warm-season
+  level. **This part is emissions.**
+- Winter's own weather then multiplies this by about
+  `r round(s["winter"] / s["winter_in_warm_weather"], 1)`, giving the measured
+  `r round(s["winter"], 1)` µg/m³.
+
+So the two causes do not add up, they multiply: winter is roughly
+`r round(s["winter_in_warm_weather"] / s["warm"], 1)` (more emissions) ×
+`r round(s["winter"] / s["winter_in_warm_weather"], 1)` (worse weather) ≈
+`r round(s["winter"] / s["warm"], 1)` times the warm season. Read the other
+way round, the message is the same: under winter weather, switching from
+warm-season to winter emissions multiplies the level by
+`r round(s["winter"] / s["warm_in_winter_weather"], 1)`. Weather is an
+amplifier. It needs something to amplify.
+
+# The human rhythm
+
+## A winter day, hour by hour
+
+```{r fig-diurnal, fig.height=6.4}
+diurnal <- city_hourly %>%
+  filter(season %in% c("Winter", "Warm season")) %>%
+  group_by(season, hour) %>%
+  summarise(pm25_med = median(pm25), q25 = quantile(pm25, 0.25), q75 = quantile(pm25, 0.75),
+            blh_med = median(blh, na.rm = TRUE),   # na.rm: BLH is missing for Jan-Jun 2024 only
+            .groups = "drop")
+
+hour_axis <- scale_x_continuous(breaks = seq(0, 21, 3), labels = function(h) sprintf("%02d:00", h),
+                                expand = expansion(0.01))
+
+p_pm <- ggplot(diurnal, aes(hour, pm25_med, colour = season, fill = season)) +
+  geom_ribbon(aes(ymin = q25, ymax = q75), alpha = 0.18, colour = NA) +
+  geom_line(linewidth = 1) +
+  who_line() +
+  geom_text(data = ~ filter(.x, hour == 14), aes(label = season),
+            vjust = -1.1, fontface = "bold", size = 3.8) +
+  hour_axis +
+  scale_y_continuous(limits = c(0, NA), expand = expansion(c(0, 0.05))) +
+  scale_colour_manual(values = SEASON_COLOURS) + scale_fill_manual(values = SEASON_COLOURS) +
+  labs(title = "Winter pollution has a daily rhythm; the warm season has none",
+       subtitle = "Median PM2.5 by hour of day. Bands show the middle 50% of hours.",
+       x = NULL, y = PM_AXIS) +
+  theme(legend.position = "none")
+
+p_blh <- ggplot(diurnal, aes(hour, blh_med, colour = season)) +
+  geom_line(linewidth = 1) +
+  hour_axis +
+  scale_y_continuous(limits = c(0, NA), expand = expansion(c(0, 0.05)), labels = comma) +
+  scale_colour_manual(values = SEASON_COLOURS) +
+  labs(subtitle = "Median boundary layer height by hour of day: the lid rises and falls in both seasons.",
+       x = "Hour of day (local time)", y = "Boundary layer (m)", caption = SOURCE) +
+  theme(legend.position = "none")
+
+p_pm / p_blh + plot_layout(heights = c(2, 1))
+```
+
+```{r diurnal-numbers}
+winter_profile <- diurnal %>% filter(season == "Winter")
+evening_peak <- winter_profile %>% filter(hour >= 17) %>% slice_max(pm25_med, n = 1)
+morning_peak <- winter_profile %>% filter(hour %in% 8:14) %>% slice_max(pm25_med, n = 1)
+night_low    <- winter_profile %>% slice_min(pm25_med, n = 1)
+warm_range   <- diurnal %>% filter(season == "Warm season") %>% pull(pm25_med) %>% range()
+```
+
+The two panels share the same x-axis and are stacked, so each hour can be read
+straight down from pollution to lid height.
+
+**What we see.**
+
+- Winter has two peaks: in the evening around
+  `r sprintf("%02d:00", evening_peak$hour)` (`r round(evening_peak$pm25_med)` µg/m³)
+  and in the late morning around `r sprintf("%02d:00", morning_peak$hour)`
+  (`r round(morning_peak$pm25_med)` µg/m³). The cleanest hour is
+  `r sprintf("%02d:00", night_low$hour)` (`r round(night_low$pm25_med)` µg/m³).
+- The lowest winter pollution comes at the end of the night, when the lid is
+  at its lowest but the city is asleep. Pollution rises when people get up and
+  again when they come home, heat and cook.
+- The warm season has the same daily lid cycle, even stronger, yet its line
+  stays between `r round(warm_range[1], 1)` and `r round(warm_range[2], 1)` µg/m³
+  all day.
+
+The evening peak is helped by the lid closing at sunset, so it is a joint
+effect of weather and activity. But the lid closes every evening in the warm
+season too, and nothing happens. The rhythm appears only when there are winter
+emissions.
+
+## Working days and weekends
+
+```{r fig-weekday, fig.height=4.2}
+city_hourly %>%
+  filter(season == "Winter") %>%
+  group_by(weekday, hour) %>%
+  summarise(pm25 = median(pm25), .groups = "drop") %>%
+  ggplot(aes(hour, fct_rev(weekday), fill = pm25)) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  scale_fill_viridis_c(option = "rocket", direction = -1, limits = c(0, NA), name = PM_LEGEND) +
+  scale_x_continuous(breaks = seq(0, 21, 3), labels = function(h) sprintf("%02d:00", h), expand = expansion(0)) +
+  labs(title = "The same rhythm seven days a week",
+       subtitle = "Median winter PM2.5 for each hour of each weekday.",
+       x = "Hour of day (local time)", y = NULL, caption = SOURCE) +
+  theme(panel.grid = element_blank(), legend.position = "right")
+```
+
+```{r weekend-test}
+weekend_data <- winter_model_data %>% mutate(residual = resid(weather_model))
+weekend_test <- wilcox.test(residual ~ is_weekend, data = weekend_data)
+weekend_gap  <- weekend_data %>% group_by(is_weekend) %>% summarise(m = mean(residual))
+weekend_ratio <- exp(diff(weekend_gap$m))   # weekend level relative to working days
+```
+
+If commuter traffic were the main source, working days should be dirtier than
+weekends. To compare them fairly we remove the weather effect first (we compare
+the residuals of the weather model) and use a Wilcoxon rank-sum test, which
+does not assume normal data.
+
+**What we see.** The evening and late-morning bands run through all seven
+rows. After removing weather, weekends are
+`r percent(abs(weekend_ratio - 1))` `r if_else(weekend_ratio > 1, "higher", "lower")`
+than working days, and the difference is not statistically significant
+(p = `r sprintf("%.2f", weekend_test$p.value)`). **Winter pollution does not
+follow the working week.** This points to a source that runs every day in
+winter and stops in the warm season, which fits residential heating better
+than commuter traffic. Our data cannot identify the source directly, so this
+is an indication, not proof.
+
+
+## When the city stops going to work
+
+Weekends are a weak test: many people in Yerevan work on Saturday. A stronger
+one is the New Year holiday, `r length(HOLIDAYS)` consecutive non-working days
+at the start of January, when offices, schools and building sites close but
+homes are still heated, and more people are at home all day.
+
+```{r holiday-data}
+mark_holiday <- function(data) {
+  data %>% mutate(day_type = if_else(format(date, "%m-%d") %in% HOLIDAYS,
+                                     "New Year holiday", "Ordinary winter day"))
+}
+
+holiday_hours <- city_hourly %>% filter(season == "Winter") %>% mark_holiday()
+
+# Shape of the day: evening level relative to morning level, on the same day
+day_shape <- holiday_hours %>%
+  filter(hour %in% c(7, 8, 9, 20, 21, 22, 23)) %>%
+  mutate(part = if_else(hour <= 9, "morning", "evening")) %>%
+  group_by(date, day_type, part) %>%
+  summarise(pm25 = mean(pm25), .groups = "drop") %>%
+  pivot_wider(names_from = part, values_from = pm25) %>%
+  filter(!is.na(morning), !is.na(evening)) %>%
+  mutate(ratio = evening / morning)
+
+shape_test <- wilcox.test(ratio ~ day_type, data = day_shape)
+shape_median <- day_shape %>% group_by(day_type) %>% summarise(ratio = median(ratio), n = n())
+```
+
+```{r fig-holiday, fig.height=4.6}
+holiday_hours %>%
+  group_by(day_type, hour) %>%
+  summarise(pm25 = median(pm25), .groups = "drop") %>%
+  ggplot(aes(hour, pm25, colour = day_type)) +
+  annotate("rect", xmin = 6.5, xmax = 9.5, ymin = -Inf, ymax = Inf, fill = "grey85", alpha = 0.45) +
+  annotate("text", x = 8, y = 2, label = "morning", size = 3, colour = "grey35") +
+  annotate("rect", xmin = 19.5, xmax = 23, ymin = -Inf, ymax = Inf, fill = "grey85", alpha = 0.45) +
+  annotate("text", x = 21.2, y = 2, label = "evening", size = 3, colour = "grey35") +
+  geom_line(linewidth = 1) +
+  who_line() +
+  geom_text(data = ~ filter(.x, hour == 15),
+            aes(label = day_type, vjust = if_else(day_type == "New Year holiday", -1.2, 2.0)),
+            fontface = "bold", size = 3.6) +
+  scale_x_continuous(breaks = seq(0, 21, 3), labels = function(h) sprintf("%02d:00", h),
+                     expand = expansion(0.01)) +
+  scale_y_continuous(limits = c(0, NA), expand = expansion(c(0, 0.08))) +
+  scale_colour_manual(values = c("New Year holiday" = "#7B3294", "Ordinary winter day" = COL_WINTER)) +
+  labs(title = "On holidays the morning peak fades, the evening peak grows",
+       subtitle = "Median winter PM2.5 by hour of day, holidays against ordinary winter days.",
+       x = "Hour of day (local time)", y = PM_AXIS, caption = SOURCE) +
+  theme(legend.position = "none")
+```
+
+Both curves are drawn in one panel on a shared axis so the *shape* can be
+compared, not just the level. The two periods used in the test are shaded
+(Gestalt principle of enclosure).
+
+**What we see.** The holiday evening is
+`r sprintf("%.1f", shape_median$ratio[shape_median$day_type == "New Year holiday"])`
+times its own morning, against
+`r sprintf("%.1f", shape_median$ratio[shape_median$day_type == "Ordinary winter day"])`
+on ordinary days (Wilcoxon rank-sum test, p =
+`r sprintf("%.4f", shape_test$p.value)`;
+`r shape_median$n[shape_median$day_type == "New Year holiday"]` holiday days
+against `r shape_median$n[shape_median$day_type == "Ordinary winter day"]`).
+Because this is a ratio within the same day, it does not depend on how bad
+that day's weather was.
+
+So the two peaks have different owners. The morning peak needs the city to go
+to work; it fades when the city stays home. The evening peak does not fade, it
+grows, and it grows on days when nobody commutes. The air does not get cleaner
+overall during the holidays. Whatever produces most of the winter load keeps
+running when the city stops.
+
+# What is burning?
+
+Our sensors show that winter emissions exist, when they appear, and that they
+run every day. They cannot tell us *what* is burning. No measured breakdown of
+Yerevan's PM2.5 by source has been published, so we bring in two published
+datasets that bear directly on the question.
+
+```{r load-heating}
+gas_monthly <- read_project_csv(
+  "armenia_household_gas_monthly_2020.csv",
+  cols(month = col_integer(), gas_mln_kwh = col_double(), source = col_character())
+)
+heating_fuels <- read_project_csv(
+  "yerevan_heating_fuels.csv",
+  cols(fuel = col_character(), share_of_households_pct = col_double(),
+       pm25_kg_per_tj = col_double(), .default = col_character())
+)
+```
+
+## Pollution follows the heating calendar
+
+Household gas use is a good record of how much homes are heated in each
+month (the flat summer level is cooking and hot water). If heating drives winter pollution, the two calendars should match.
+
+```{r fig-heating-calendar, fig.height=5.6}
+heating_calendar <- city_hourly %>%
+  group_by(month) %>%
+  summarise(pm25 = median(pm25), .groups = "drop") %>%
+  left_join(gas_monthly, by = "month") %>%
+  mutate(month_name = factor(month.abb[month], levels = month.abb),
+         period = if_else(month %in% WINTER_MONTHS, "Winter", "Rest of the year"))
+
+calendar_cor <- cor(heating_calendar$pm25, heating_calendar$gas_mln_kwh, method = "spearman")
+
+period_fill <- scale_fill_manual(values = c("Winter" = COL_WINTER, "Rest of the year" = "grey75"), guide = "none")
+
+p_cal_pm <- ggplot(heating_calendar, aes(month_name, pm25, fill = period)) +
+  geom_col(width = 0.7) + who_line() + period_fill +
+  scale_y_continuous(expand = expansion(c(0, 0.05))) +
+  labs(title = "The air gets dirty in the months when homes are heated",
+       subtitle = "Median PM2.5 by month (our sensors, 2023 to 2026)",
+       x = NULL, y = PM_AXIS)
+
+p_cal_gas <- ggplot(heating_calendar, aes(month_name, gas_mln_kwh, fill = period)) +
+  geom_col(width = 0.7) + period_fill +
+  scale_y_continuous(expand = expansion(c(0, 0.05)), labels = comma) +
+  labs(subtitle = "Natural gas used by households in Armenia by month (2020)",
+       x = NULL, y = "Million kWh",
+       caption = paste0(SOURCE, "\nGas use: R2E2 (2022), Analysis of Options for Sustainable Heating in Armenia."))
+
+p_cal_pm / p_cal_gas
+```
+
+The two quantities have different units, so they are drawn in two aligned
+panels with a shared month axis, not on one chart with two y-axes (a double
+axis lets the designer create any impression by rescaling). Bars start at zero.
+
+**What we see.** The two calendars have the same shape: low from May to
+October, a jump in November, a peak in December and January. The rank
+correlation across the twelve months is `r sprintf("%.2f", calendar_cor)`.
+The match is not perfect: from February to April homes are still heated but
+the air is already cleaner, because the lid over the city rises in spring.
+Heating supplies the particles and weather decides how many stay, as in
+Section 6. The gas data is national and from 2020, so it shows the *calendar*
+of heating, not its amount in our winters. Gas itself burns cleanly, which leads to the
+next question: which heating fuel produces the particles?
+
+## A few stoves can outweigh a city of boilers
+
+A household survey gives the heating fuels of Yerevan homes, and emission
+inventories give how much PM2.5 each fuel releases per unit of heat. Combining
+the two shows which fuel the heating particles come from.
+
+```{r heating-shares}
+heating_shares <- heating_fuels %>%
+  mutate(
+    heating_share  = share_of_households_pct / sum(share_of_households_pct),   # homes can name several fuels
+    particles      = share_of_households_pct * pm25_kg_per_tj,                 # assumes equal heat per home
+    particle_share = particles / sum(particles)
+  )
+
+wood <- heating_shares %>% filter(fuel == "Firewood")
+gas  <- heating_shares %>% filter(fuel == "Natural gas")
+```
+
+```{r fig-heating-shares, fig.height=3.6}
+heating_shares %>%
+  select(fuel, `Share of home heating` = heating_share, `Share of heating particles (PM2.5)` = particle_share) %>%
+  pivot_longer(-fuel, names_to = "measure", values_to = "share") %>%
+  mutate(measure = fct_rev(fct_inorder(measure))) %>%
+  ggplot(aes(share, fct_rev(fct_inorder(fuel)), fill = measure)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  geom_text(aes(label = percent(share, 1)), position = position_dodge(width = 0.75), hjust = -0.2, size = 3.6) +
+  scale_x_continuous(labels = label_percent(), limits = c(0, 1.08), expand = expansion(0)) +
+  scale_fill_manual(values = c("Share of home heating" = "grey70", "Share of heating particles (PM2.5)" = "grey15"),
+                    name = NULL, guide = guide_legend(reverse = TRUE)) +
+  labs(title = "Firewood heats few homes but produces almost all heating particles",
+       subtitle = "Yerevan households by heating fuel, and the estimated share of heating PM2.5 from each fuel.",
+       x = NULL, y = NULL,
+       caption = "Fuel shares: ILCS 2020 household survey (in R2E2, 2022). Emission factors: German emission inventory (2025).") +
+  theme(panel.grid.major.y = element_blank())
+```
+
+For each fuel the two bars sit side by side (Gestalt principle of proximity),
+so the eye compares them directly. The values are printed on the bars, so no
+gridlines are needed to read them.
+
+**What we see.** Firewood is the heating fuel of about
+`r percent(wood$heating_share, 1)` of Yerevan homes, yet it accounts for about
+`r percent(wood$particle_share, 1)` of the particles from home heating. The
+reason is the emission factor: per unit of heat, burning wood releases about
+`r comma(wood$pm25_kg_per_tj / gas$pm25_kg_per_tj)` times more PM2.5 than
+burning gas. A city heated mostly by gas can still have a wood-smoke problem.
+
+**How far this goes.** This is an estimate, not a measurement. It assumes the
+same heat demand per home, uses emission factors from modern German
+appliances (older stoves emit more), and leaves out open burning of leaves and
+waste, the wood-heated villages around the city that share the same basin, and
+particles that form in the air from boiler and traffic gases. All of these
+except the last push in the same direction: towards solid fuel and open
+burning as the main winter source. Traffic is not ruled out as a contributor,
+but it runs all year, and the warm season shows what traffic alone produces.
+
+# Where, and is it getting worse?
+
+## Across the city
+
+```{r fig-map, fig.width=7, fig.height=5.6}
+last_winter <- max(winter_daily$winter)
+
+sensor_winter <- pm %>%
+  add_time_parts() %>%
+  filter(season == "Winter", winter_label(date) == last_winter) %>%
+  group_by(sensor_id) %>%
+  summarise(pm25 = median(pm25), n_hours = n(), .groups = "drop") %>%
+  left_join(sensors, by = "sensor_id")
+
+ggplot(sensor_winter, aes(lon, lat)) +
+  annotate("point", x = 44.5126, y = 40.1777, shape = 3, size = 4, colour = "grey30") +
+  annotate("text", x = 44.5126, y = 40.1777, label = "Republic Square", hjust = -0.12, size = 3, colour = "grey30") +
+  geom_point(aes(fill = pm25), shape = 21, size = 6, colour = "grey20") +
+  geom_label_repel(aes(label = paste0("Sensor ", sensor_id, ": ", round(pm25))),
+                   size = 3, box.padding = 0.9, point.padding = 0.6, min.segment.length = 0,
+                   label.size = 0.15, seed = 3) +
+  scale_fill_viridis_c(option = "rocket", direction = -1, limits = c(0, NA), name = PM_LEGEND) +
+  coord_quickmap(xlim = c(44.44, 44.60), ylim = c(40.12, 40.23)) +
+  labs(title = "Polluted everywhere, most of all in the south",
+       subtitle = paste0("Median hourly PM2.5 (\u00b5g/m\u00b3) per sensor, winter ", last_winter, ". Each circle is one sensor."),
+       x = "Longitude", y = "Latitude", caption = SOURCE) +
+  theme(legend.position = "right")
+```
+
+The value is encoded by colour, not by circle size, because people judge areas
+poorly. `coord_quickmap()` keeps the correct proportion between longitude and
+latitude, so distances are not stretched.
+
+**What we see.** Every sensor has a winter median above the WHO guideline,
+from `r round(min(sensor_winter$pm25))` to `r round(max(sensor_winter$pm25))` µg/m³.
+The highest values are in the south of the city. Two sensors (83131 and 85218)
+stand about 200 m apart and report nearly the same value, which again supports
+the reliability of the devices. With `r nrow(sensor_winter)` sensors we can
+describe differences between these places, not map whole districts.
+
+## Three winters compared
+
+The number of sensors grew over time, which could fake a trend. So here we use
+only the two sensors that cover all three winters
+(`r paste(LONG_SENSORS, collapse = " and ")`), on days when both reported.
+
+```{r trend}
+trend_data <- sensor_daily %>%
+  filter(sensor_id %in% LONG_SENSORS) %>%
+  group_by(date) %>%
+  filter(n() == length(LONG_SENSORS)) %>%        # days when both sensors are present
+  summarise(pm25 = mean(pm25), .groups = "drop") %>%
+  left_join(weather_daily, by = "date") %>%
+  filter(month(date) %in% WINTER_MONTHS) %>%
+  mutate(winter = winter_label(date))
+
+# Ratio of each winter to the first one, with Newey-West confidence intervals
+winter_ratios <- function(model, label) {
+  ct <- coeftest(model, vcov. = NeweyWest(model))
+  rows <- str_detect(rownames(ct), "^winter")
+  tibble(winter = str_remove(rownames(ct)[rows], "winter"),
+         ratio  = exp(ct[rows, "Estimate"]),
+         low    = exp(ct[rows, "Estimate"] - 1.96 * ct[rows, "Std. Error"]),
+         high   = exp(ct[rows, "Estimate"] + 1.96 * ct[rows, "Std. Error"]),
+         version = label)
+}
+
+trend_raw      <- lm(log(pm25) ~ winter, data = trend_data)
+trend_adjusted <- lm(log(pm25) ~ winter + wind + temp + rh + rain_day, data = trend_data)
+
+ratios <- bind_rows(winter_ratios(trend_raw, "As measured"),
+                    winter_ratios(trend_adjusted, "Adjusted for weather"))
+```
+
+```{r fig-trend, fig.height=4.4}
+p_box <- ggplot(trend_data, aes(winter, pm25)) +
+  geom_boxplot(fill = COL_WINTER, alpha = 0.6, outlier.size = 0.7, linewidth = 0.35) +
+  who_line() +
+  scale_y_log10() +
+  labs(subtitle = "Daily PM2.5 per winter", x = NULL, y = PM_AXIS_LOG)
+
+p_ratio <- ggplot(ratios, aes(winter, ratio, colour = version)) +
+  geom_hline(yintercept = 1, colour = "grey40") +
+  geom_pointrange(aes(ymin = low, ymax = high), position = position_dodge(width = 0.4),
+                  linewidth = 0.8, size = 0.6) +
+  scale_y_continuous(labels = function(x) paste(x, "times")) +
+  scale_colour_manual(values = c("As measured" = "grey50", "Adjusted for weather" = COL_WINTER), name = NULL) +
+  labs(subtitle = "Level relative to winter 2023/24 (95% intervals)", x = NULL, y = "Ratio to 2023/24")
+
+p_box + p_ratio +
+  plot_annotation(title = "No sign of improvement over three winters",
+                  caption = SOURCE)
+```
+
+The adjustment uses wind, temperature, humidity and rain. Boundary layer height
+cannot be used here because it is missing for half of the first winter.
+
+```{r trend-numbers}
+adj <- ratios %>% filter(version == "Adjusted for weather")
+```
+
+**What we see.** After adjusting for weather, the level was
+`r percent(adj$ratio[1] - 1)` higher in `r adj$winter[1]` and
+`r percent(adj$ratio[2] - 1)` higher in `r adj$winter[2]` than in 2023/24.
+The intervals are wide and reach down to "no change" (a ratio of 1), so this
+is not proof of a rising trend. What we can say is that the air has not
+improved, and that the higher levels of the latest winter are not explained
+by worse weather.
+
+# Do the results hold?
+
+We repeat the four headline numbers under different choices. If a conclusion
+depended on one choice, it would change here.
+
+```{r robustness}
+headline <- function(hourly) {
+  daily   <- build_daily(hourly)
+  w_daily <- daily %>% filter(season == "Winter", !is.na(blh))
+  seasons <- hourly %>% filter(season %in% c("Winter", "Warm season"), !is.na(blh))
+  same_weather_model <- lm(log(pm25) ~ log(blh) + wind + rh + I(rain > 0) + season, data = seasons)
+  tibble(
+    `Winter median PM2.5 (µg/m³)`         = median(hourly$pm25[hourly$season == "Winter"]),
+    `Winter days above WHO guideline`     = mean(daily$pm25[daily$season == "Winter"] > WHO_DAILY),
+    `Day-to-day variation explained by weather` =
+      summary(lm(log(pm25) ~ log(blh) + wind + temp + rh + rain_day, data = w_daily))$r.squared,
+    `Winter vs warm season at equal weather` = exp(coef(same_weather_model)[["seasonWinter"]])
+  )
+}
+
+variants <- list(
+  "Main analysis"                       = city_hourly,
+  "Without very humid hours (RH > 90%)" = city_hourly %>% filter(is.na(rh) | rh <= HUMID_LIMIT),
+  "Only the four long-running sensors"  = build_city_hourly(pm %>% filter(sensor_id %in% PANEL_SENSORS)),
+  "Winter 2024/25 and its warm season"  = city_hourly %>% filter(date >= "2024-05-01", date < "2025-05-01"),
+  "Winter 2025/26 and its warm season"  = city_hourly %>% filter(date >= "2025-05-01", date < "2026-05-01")
+)
+
+robustness <- map_dfr(variants, headline, .id = "Variant")
+
+robustness %>%
+  mutate(`Winter median PM2.5 (µg/m³)` = round(`Winter median PM2.5 (µg/m³)`, 1),
+         across(c(`Winter days above WHO guideline`, `Day-to-day variation explained by weather`), ~ percent(.x, 1)),
+         `Winter vs warm season at equal weather` = paste(round(`Winter vs warm season at equal weather`, 1), "times")) %>%
+  knitr::kable(align = "lrrrr")
+```
+
+Low-cost sensors can over-read in fog, so the second row removes very humid
+hours. The last column is the winter-to-warm-season ratio from one model that
+holds lid height, wind, humidity and rain equal.
+
+**What we see.** The numbers move, but the conclusions do not: in every
+variant most winter days exceed the guideline, weather explains roughly half
+of the day-to-day variation, and winter air is at least twice as dirty as
+warm-season air under the same weather.
+
+# Limitations
+
+- **Citizen sensors.** They are not reference monitors. Their absolute values
+  can be off, but their agreement with each other (Section 4) supports the
+  patterns, which is what our argument uses.
+- **One weather point.** Weather comes from a reanalysis grid cell for central
+  Yerevan, not from a station. It describes city-wide conditions well, local
+  ones less so.
+- **Few sensors early on.** Until December 2023 only one or two sensors were
+  active, so the first winter is less certain.
+- **Association, not proof.** We show what weather can and cannot explain. We
+  do not measure sources directly. "Heating" is the explanation most
+  consistent with the patterns, not a measured fact.
+- **Published figures in Section 8.** The fuel survey and gas data are from
+  2020 and the emission factors from another country. They indicate the
+  likely source; they do not measure it.
+- **PM2.5 only.** These sensors report PM10 as well, but the ratio between the
+  two is almost constant (about 0.5) in every month and every hour, which is a
+  property of this sensor model rather than of the air. PM10 therefore carries
+  no information here that PM2.5 does not.
+- **"Emissions" is a remainder.** In the season comparison, "emissions" means
+  everything that differs between the seasons apart from lid height, wind,
+  humidity and rain.
+- **Temperature belongs to both sides.** Cold is weather, and cold makes
+  people heat. We kept it out of the season comparison for this reason.
+
+# Verdict
+
+**Is it the weather, or is it us? It is both, but not in the same way.**
+
+1. **Weather decides which days are bad.** Lid height and wind explain
+   `r percent(weather_r2)` of the day-to-day variation within winter. On this
+   point the official explanation is right.
+2. **Weather does not create the pollution.** Under the same low lid, warm-season
+   air stays at about `r round(get(low_lid, "Warm season"))` µg/m³ and winter
+   air reaches `r round(get(low_lid, "Winter"))`. With winter weather but
+   warm-season emissions, the city would stay at about
+   `r round(s["warm_in_winter_weather"])` µg/m³, far below the WHO guideline.
+3. **What accounts for what.** Winter is about `r round(s["winter"] / s["warm"], 1)`
+   times dirtier than the warm season: roughly
+   `r round(s["winter_in_warm_weather"] / s["warm"], 1)` times from winter emissions
+   and `r round(s["winter"] / s["winter_in_warm_weather"], 1)` times from winter
+   weather acting on them.
+4. **The human fingerprint.** Pollution follows the daily routine of the city,
+   runs seven days a week, exists only in the heating season, and has not
+   declined over three winters. During the New Year holiday the morning peak
+   fades while the evening peak grows, so the main load is not commuting.
+
+5. **What is burning.** Pollution follows the heating calendar. Among heating
+   fuels, firewood serves about `r percent(wood$heating_share, 1)` of Yerevan
+   homes but produces about `r percent(wood$particle_share, 1)` of heating
+   particles. This is an estimate from published figures, not a measurement.
+
+**What the city can do.**
+
+- **Reduce what gets trapped.** The weather cannot be changed, the emissions
+  can. The evidence points first at solid-fuel stoves and open burning: few
+  households, most of the heating particles. Helping those homes switch to
+  clean heating would cut the largest source while affecting the fewest people.
+- **Use the forecast, and act early.** Lid height and wind are forecast a day
+  ahead. Because pollution accumulates by about
+  `r percent(wind_change$pct_per_day[1], 1)` a day once the air goes still, the
+  gain from acting on the first calm day is much larger than acting on the
+  fourth. Alerts and temporary limits belong at the start of a stagnant spell.
+- **Measure sources.** Our data shows *when* and *how much*, not *what burns*.
+  A source study would turn this indication into evidence.
+
+# Appendix A: model check {-}
+
+The weather model assumes a roughly linear relationship, constant spread and
+roughly normal residuals. The third panel shows how strongly each day's
+residual is related to the previous days, which is why we used Newey-West
+standard errors.
+
+```{r fig-diagnostics, fig.height=3.4}
+diag <- tibble(fitted = fitted(weather_model), residual = resid(weather_model))
+acf_values <- acf(diag$residual, lag.max = 14, plot = FALSE)
+acf_data <- tibble(lag = as.numeric(acf_values$lag)[-1], acf = as.numeric(acf_values$acf)[-1])
+acf_limit <- 1.96 / sqrt(nrow(diag))
+
+p1 <- ggplot(diag, aes(fitted, residual)) +
+  geom_hline(yintercept = 0, colour = "grey40") +
+  geom_point(alpha = 0.5, size = 1) + geom_smooth(se = FALSE, colour = COL_WHO, linewidth = 0.6) +
+  labs(subtitle = "Residuals vs fitted", x = "Fitted log(PM2.5)", y = "Residual")
+p2 <- ggplot(diag, aes(sample = residual)) +
+  geom_qq(alpha = 0.5, size = 1) + geom_qq_line(colour = COL_WHO) +
+  labs(subtitle = "Normal Q-Q plot", x = "Theoretical quantiles", y = "Residual quantiles")
+p3 <- ggplot(acf_data, aes(lag, acf)) +
+  geom_col(width = 0.5, fill = "grey40") +
+  geom_hline(yintercept = c(-acf_limit, acf_limit), linetype = "dashed", colour = COL_WHO) +
+  labs(subtitle = "Autocorrelation of residuals", x = "Lag (days)", y = "Correlation")
+
+p1 + p2 + p3
+```
+
+# Appendix B: the design rules we followed {-}
+
+The course gives rules for honest and readable charts. The table says where
+each one is used. "Lie Factor" is Tufte's ratio between the size of an effect
+as drawn and its size in the data; it should be 1.
+
+```{r principles-table}
+tribble(
+  ~Figure,                      ~`Chart type`,            ~`Principles applied`,
+  "Three years of daily PM2.5", "Line + shaded bands",    "Zero origin; winters grouped by enclosure; WHO line gives context (compared to what?); events labelled on the plot",
+  "Calendar of bad days",       "Heatmap",                "Sequential palette, dark = more; classes set at WHO health thresholds; gridlines removed (data-ink)",
+  "Seasonal gap",               "Boxplots, log scale",    "Whole distributions, not means; log scale because the data is right-skewed; share above guideline printed",
+  "Sensor agreement",           "Correlation heatmap",    "Lower triangle only (the rest is redundant ink); scale fixed to 0-1 so high values are not exaggerated; square cells",
+  "Lid and wind",               "Binned heatmap",         "Binning instead of thousands of overplotted points; minimum group size; sequential palette",
+  "Weather effects",            "Coefficient plot",       "Uncertainty shown as intervals; effects converted to percent change so the units are readable",
+  "Episodes build and break",   "Bars + change bars",     "Bars from zero; change drawn around a zero line with the two directions in two colours",
+  "The longest episode",        "Stacked panels",         "Shared x-axis so days align (proximity); the episode marked by enclosure",
+  "Same weather, different air","Two lines + bands",      "Direct labels instead of a legend (similarity, connection); shared axis for a fair comparison; spread shown, not only the middle",
+  "What accounts for what",     "Bars",                   "Zero origin; measured and modelled values separated by transparency, not by colour",
+  "Daily rhythm",               "Line + ribbon, stacked", "Uncertainty as an interquartile band; the lid panel aligned below so hours can be read down",
+  "Holiday test",               "Two lines",              "Compared by shape on one axis; the two tested periods marked by enclosure",
+  "Heating calendar",           "Two aligned bar panels", "Two y-axes avoided: a double axis can be rescaled to suggest any relationship",
+  "Heating fuels",              "Paired bars",            "Pairs placed side by side (proximity); values printed so no gridlines are needed",
+  "Sensor map",                 "Points on coordinates",  "Value shown by colour, not by area, because areas are judged poorly; map proportions kept correct",
+  "Three winters",              "Boxplots + intervals",   "Raw and adjusted shown together; intervals included so the reader sees what is uncertain"
+) %>% knitr::kable()
+```
+
+Colour is used in one way throughout: a qualitative pair for the two seasons
+(different in both hue and lightness, so it survives greyscale and the common
+forms of colour blindness), sequential scales for amounts, and diverging scales
+centred on zero where zero is meaningful. Every chart carries its units and its
+source. No chart uses 3D, a second y-axis, or a rainbow palette.
+```{r session}
+sessionInfo()
+```

@@ -1,0 +1,4 @@
+fuel,share_of_households_pct,pm25_kg_per_tj,share_source,factor_source
+Natural gas,79.8,0.03,"ILCS 2020 household survey, Yerevan (R2E2 2022, Table 1.25)","German emission inventory 2025, residential combustion (Table 1)"
+Electricity,39.0,0,"ILCS 2020 household survey, Yerevan (R2E2 2022, Table 1.25)","No particles emitted at the home"
+Firewood,2.2,53.4,"ILCS 2020 household survey, Yerevan (R2E2 2022, Table 1.25)","German emission inventory 2025, residential combustion (Table 1)"
