@@ -80,7 +80,7 @@ table together.
 │   ├── armenia_household_gas_monthly_2020.csv         published figures, sourced per row
 │   └── yerevan_heating_fuels.csv                      published figures, sourced per row
 ├── docs/
-│   ├── report.html      the knitted report (served by GitHub Pages)
+│   ├── report.html      the knitted report
 └── figures/            key charts, exported for this README
 ```
 
